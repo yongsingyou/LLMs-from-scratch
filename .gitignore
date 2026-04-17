@@ -349,3 +349,9 @@ cython_debug/
 .pixi
 *.egg-info
 
+
+# model
+model.*
+instruction-data.json
+checkpoint
+hparams.json
