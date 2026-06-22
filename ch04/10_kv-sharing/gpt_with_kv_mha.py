@@ -17,8 +17,8 @@ import torch.nn as nn
 #####################################
 # Chapter 3
 #####################################
-class MultiHeadAttentionWithSWA(nn.Module):
-    def __init__(self, d_in, d_out, dropout, num_heads, qkv_bias=False, sliding_window_size=None):
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_in, d_out, dropout, num_heads, qkv_bias=False):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
 
@@ -31,7 +31,6 @@ class MultiHeadAttentionWithSWA(nn.Module):
         self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.out_proj = nn.Linear(d_out, d_out)  # Linear layer to combine head outputs
         self.dropout = nn.Dropout(dropout)
-        self.sliding_window_size = sliding_window_size
 
         ####################################################
         # KV cache-related code
@@ -56,32 +55,12 @@ class MultiHeadAttentionWithSWA(nn.Module):
         ####################################################
         # KV cache-related
         if use_cache:
-            old_cache_k, old_cache_v = self.cache_k, self.cache_v
-            old_len = 0 if old_cache_k is None else old_cache_k.size(1)
-            if old_cache_k is None:
-                combined_k, combined_v = keys_new, values_new
+            if self.cache_k is None:
+                self.cache_k, self.cache_v = keys_new, values_new
             else:
-                combined_k = torch.cat([old_cache_k, keys_new], dim=1)
-                combined_v = torch.cat([old_cache_v, values_new], dim=1)
-
-            keys, values = combined_k, combined_v
-            if self.sliding_window_size is not None:
-                # During chunked prefill we need up to W-1 older keys plus the whole
-                # current chunk (so the earliest queries in the chunk keep their full
-                # sliding-window context)
-                attn_keep = min(keys.size(1), self.sliding_window_size + num_tokens - 1)
-                keys = keys[:, -attn_keep:, :, :]
-                values = values[:, -attn_keep:, :, :]
-
-                cache_keep = min(combined_k.size(1), self.sliding_window_size)
-                self.cache_k = combined_k[:, -cache_keep:, :, :]
-                self.cache_v = combined_v[:, -cache_keep:, :, :]
-            else:
-                self.cache_k, self.cache_v = combined_k, combined_v
-
-            dropped = combined_k.size(1) - keys.size(1)
-            k_start_pos_abs = (self.ptr_current_pos - old_len) + dropped
-            q_start_pos_abs = self.ptr_current_pos
+                self.cache_k = torch.cat([self.cache_k, keys_new], dim=1)
+                self.cache_v = torch.cat([self.cache_v, values_new], dim=1)
+            keys, values = self.cache_k, self.cache_v
         else:
             keys, values = keys_new, values_new
         ####################################################
@@ -95,27 +74,23 @@ class MultiHeadAttentionWithSWA(nn.Module):
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
         ####################################################
-        # causal + sliding-window mask
+        # causal mask
         num_tokens_Q = queries.shape[-2]
         num_tokens_K = keys.shape[-2]
         device = queries.device
-        # Determine absolute positions for q and k
         if use_cache:
-            q_start = q_start_pos_abs
-            k_start = k_start_pos_abs
-        else:
-            q_start = 0
-            k_start = 0
-        q_positions = torch.arange(q_start, q_start + num_tokens_Q, device=device, dtype=torch.long)
-        k_positions = torch.arange(k_start, k_start + num_tokens_K, device=device, dtype=torch.long)
-        # Sliding window width
-        W = num_tokens_K + 1 if self.sliding_window_size is None else int(self.sliding_window_size)
-        diff = q_positions.unsqueeze(-1) - k_positions.unsqueeze(0)
-        mask_bool = (diff < 0) | (diff >= W)
-        if use_cache:
+            q_positions = torch.arange(
+                self.ptr_current_pos,
+                self.ptr_current_pos + num_tokens_Q,
+                device=device,
+                dtype=torch.long,
+            )
             self.ptr_current_pos += num_tokens_Q
         else:
+            q_positions = torch.arange(num_tokens_Q, device=device, dtype=torch.long)
             self.ptr_current_pos = 0
+        k_positions = torch.arange(num_tokens_K, device=device, dtype=torch.long)
+        mask_bool = q_positions.unsqueeze(-1) < k_positions.unsqueeze(0)
 
         # Use the mask to fill attention scores
         attn_scores.masked_fill_(mask_bool, -torch.inf)
@@ -181,14 +156,12 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.att = MultiHeadAttentionWithSWA(
+        self.att = MultiHeadAttention(
             d_in=cfg["emb_dim"],
             d_out=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             dropout=cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"],
-            sliding_window_size=cfg["sliding_window_size"],
-        )
+            qkv_bias=cfg["qkv_bias"])
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])
         self.norm2 = LayerNorm(cfg["emb_dim"])
@@ -229,22 +202,8 @@ class GPTModel(nn.Module):
         #    *[TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         ####################################################
         #  KV cache-related
-        blocks = []
-        window_stride = cfg["sliding_window_stride"]
-        window_size = cfg["sliding_window_size"] if "sliding_window_size" in cfg else None
-        for i in range(cfg["n_layers"]):
-            blk = TransformerBlock(cfg)
-            # K:1 schedule meaning that K SWA layers are followed by 1 regular layer
-            K = int(window_stride)
-            if K <= 0:
-                # 0 => all regular; negative => all SWA
-                use_swa = False if K == 0 else True
-            else:
-                group = K + 1
-                use_swa = (i % group) < K
-            blk.att.sliding_window_size = window_size if use_swa else None
-            blocks.append(blk)
-        self.trf_blocks = nn.ModuleList(blocks)
+        self.trf_blocks = nn.ModuleList(
+            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
 
         self.current_pos = 0
         ####################################################
@@ -319,13 +278,14 @@ def generate_text_simple_cached(model, idx, max_new_tokens,
 
 
 def main():
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description="Run GPT with standard multi-head attention.")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Run GPT with standard multi-head attention."
+    )
     parser.add_argument("--emb_dim", type=int, default=768, help="Model embedding dimension.")
     parser.add_argument("--n_heads", type=int, default=12, help="Number of attention heads.")
     parser.add_argument("--n_layers", type=int, default=12, help="Number of transformer blocks.")
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Number of tokens to generate.")
-    parser.add_argument("--sliding_window_size", type=int, default=1024, help="Window size for sliding window attention.")
-    parser.add_argument("--sliding_window_stride", type=int, default=2, help="K:1 frequency sliding window attention is applied. K=5 means 5 sliding window layers follows by a regular layer.")
 
     args = parser.parse_args()
 
@@ -341,8 +301,6 @@ def main():
         "n_layers": args.n_layers,  # Number of layers
         "drop_rate": 0.0,           # Dropout rate
         "qkv_bias": False,          # Query-Key-Value bias
-        "sliding_window_size": args.sliding_window_size,
-        "sliding_window_stride": args.sliding_window_stride
     }
     torch.manual_seed(123)
     model = GPTModel(GPT_CONFIG_124M)
