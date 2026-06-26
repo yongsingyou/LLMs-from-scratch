@@ -37,6 +37,7 @@ ch07/01_main-chapter-code/loss-plot-alpaca52k.pdf
 ch07/04_preference-tuning-with-dpo/reward margins-plot.pdf
 
 # Checkpoint files
+*.pth
 model.pth
 appendix-A/01_main-chapter-code/model.pth
 
